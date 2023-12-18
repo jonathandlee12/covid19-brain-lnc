@@ -15,7 +15,7 @@ The available [R markdown file](https://github.com/jonathandlee12/covid19-brain-
 - [Ensembl v104 reference transcriptome, noncoding RNA genes](http://ftp.ensembl.org/pub/release-104/fasta/homo_sapiens/ncrna/Homo_sapiens.GRCh38.ncrna.fa.gz)
 - [Frontal cortex transcriptome profiles from this manuscript (.fastq)](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE188847)
 
-NOTE: while similar .sf files are available at GEO (from Mavrikaki et al. Nature Aging 2022), the alignments/quantifications do not include noncoding RNAs.
+NOTE: while similar .sf files are available at GEO (from Mavrikaki et al. Nature Aging 2022), the alignments/quantifications do not include noncoding RNAs. Realigned .sf files are available in the directories rnaseq_neuron/ and rnaseq_patients/.
 
 ## Resources for data analysis
 - [Cohort characteristics - COVID-19](https://github.com/jonathandlee12/covid19-brain-lnc/blob/main/TableS1_covid.csv) may also be found in Supplementary Table 1
