@@ -8,7 +8,7 @@ Severe COVID-19 leads to widespread transcriptomic changes in the human brain, m
 
 ## Code information
 
-The available [R markdown file](https://github.com/jonathandlee12/covid19-brain-lnc/blob/main/covid19_aging_rscripts_final.Rmd) contains R scripts used to generate all figures and data tables available with the current iteration of the manuscript. The code was last run 12/17/2023. 
+The available [R markdown file](https://github.com/jonathandlee12/covid19-brain-lnc/blob/main/covid19_lncrna_rscripts_final.Rmd) contains R scripts used to generate all figures and data tables available with the current iteration of the manuscript. The code was last run 12/17/2023. 
 
 ## Resources for data preprocessing
 - [Ensembl v104 reference transcriptome, protein-coding genes](http://ftp.ensembl.org/pub/release-104/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz)
