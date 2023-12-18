@@ -1,0 +1,609 @@
+---
+title: "COVID-19 Brain and LncRNAs"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+Authors: Jonathan Lee
+Last updated: 12/8/2023
+---
+
+```{r setup, include=FALSE}
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(GO.db)
+library(fgsea)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(dplyr)
+library(reshape2)
+library(pheatmap)
+library(tximport)
+library(DESeq2)
+library(Rtsne)
+library(viridis)
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 62, c = 100)[1:n]
+}
+
+substrLeft <- function(x, n){
+  substr(x, 1, nchar(x)-n)
+}
+```
+
+# RNA-seq analysis
+
+To run this script, we need the following files:
+
+- TableS1_covid.csv - COVID-19 patient cohort info, from Supplementary Table 1
+- tx2gene.txt - mapping of gene annotations (ensembl v96), available via GitHub or biomaRt
+
+For ROSMAP MMSE analysis, we need the following files from synapse:
+- ROSMAP_all_counts_matrix.txt (https://www.synapse.org/#!Synapse:syn8691134)
+- ROSMAP_clinical.csv (https://www.synapse.org/Portal.html#!Synapse:syn3157322)
+- ROSMAP_biospecimen_metadata.csv (https://www.synapse.org/Portal.html#!Synapse:syn3157322)
+
+Raw RNA-seq data are available at GEO: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE188847
+
+In directory rnaseq_covid/:
+- CONTROL1-23.salmon.sf (23x files, control samples), available from GEO
+- COVID1-22.salmon.sf (22x files, COVID samples), available from GEO
+- ICUVENT1-9.salmon.sf (9x files, ICU samples), available from GEO
+
+In directory rnaseq_neuron/:
+- 21x *.salmon.sf (CTRL, IFNB_HI, IFNB_LO, IFNG_HI, IFNG_LO, TNFA_HI, TNFA_LO), available from GEO
+
+***NOTE: while similar .sf files are available at GEO (from Mavrikaki et al. Nature Aging 2022), the alignments/quantifications do not include noncoding RNAs.
+
+TCGA RNA-seq files are available at: https://www.cancer.gov/tcga
+
+# Aligning reads to Ensembl human transcriptome
+
+```{r, eval=F}
+# concatenate reference transcriptomes as a single fasta file
+cat Homo_sapiens.GRCh38.cdna.all.fa Homo_sapiens.GRCh38.ncrna.fa > Homo_sapiens.GRCh38.full.fa
+
+# generate salmon reference index (v1.4.0)
+export PATH=/n/app/bcbio/tools/bin:$PATH
+salmon index -t Homo_sapiens.GRCh38.full.fa -i salmon_idx.full -k 31
+
+# align raw sequencing reads to reference transcriptome
+salmon quant -i $salmon_idx -l A -p $ncores -1 $dir/${base}_1.fastq -2 $dir/${base}_2.fastq -o $dir/${base}.salmon --seqBias --useVBOpt --\
+gcBias --posBias --numBootstraps 30 --validateMappings
+
+# rename output for easier identification
+for f in *.salmon; do cp $f/quant.sf $f.sf; done
+```
+
+# Patient sample cohort assessment
+
+```{r, eval=T}
+# create treatment sample matrix
+# from converting Table S1 to .csv (Mavrikaki et al. Nature Aging 2022)
+sampleinfo <- read.csv(file="TableS1_covid.csv")
+row.names(sampleinfo) <- sampleinfo$Sample.ID
+sampleinfo <- sampleinfo[order(row.names(sampleinfo)),]
+sampleinfo <- sampleinfo[,c("Group", "Age..years.", "Sex", "Library.prep.batch", "Age.Sex.Matching.Group..RNA.seq.analysis")]
+colnames(sampleinfo) <- c("treatment", "Age", "Sex", "Batch", "AgeSex")
+```
+
+# Gene expression from Salmon
+
+```{r, eval=F}
+# Obtain ensembl v96 annotations from biomaRt
+tx2gene <- getBM(attributes= c("ensembl_transcript_id","ensembl_gene_id", "external_gene_name", "entrezgene",   "gene_biotype"), mart = useDataset("hsapiens_gene_ensembl", useMart("ensembl", host="https://apr2019.archive.ensembl.org")))
+
+write.table(tx2gene, file="tx2gene.txt", sep='\t', quote=F)
+```
+
+```{r, eval=T}
+set.seed(42)
+tx2gene <- read.table(file="tx2gene.txt", sep='\t')
+
+## List all directories containing data  
+samples_patients <- list.files(path = "rnaseq_patients/", full.names = T, pattern=".sf")
+names(samples_patients) <- str_replace_all(str_replace_all(samples_patients, "rnaseq_patients//", ""), ".salmon.sf", "")
+
+# Run tximport
+txi_patients <- tximport(samples_patients, type="salmon", tx2gene=tx2gene[,c("ensembl_transcript_id", "ensembl_gene_id")], countsFromAbundance="lengthScaledTPM", ignoreTxVersion = T)
+```
+
+# Clustering analysis
+
+```{r, eval=T}
+set.seed(42)
+sampleinfo$treatment <- factor(sampleinfo$treatment, levels=c("ICU/VENT", "Control", "COVID-19"))
+rnaseq_dds <- DESeqDataSetFromTximport(txi_patients, colData = sampleinfo, design = ~treatment)
+```
+
+```{r, eval=T}
+set.seed(42)
+rnaseq_vst <- assay(varianceStabilizingTransformation(rnaseq_dds))
+```
+
+```{r, eval=T}
+write.table(merge(tx2gene[!duplicated(tx2gene[,c(2,3,5)]),c(2,3,5)], rnaseq_vst, by.x=1, by.y=0), file="rnaseq_vst_covid.txt", row.names=F, quote=F, sep='\t')
+```
+
+# differential expression analysis - COVID vs ICU/VENT
+
+```{r, eval=T}
+set.seed(1)
+rnaseq_dds <- DESeq(rnaseq_dds)
+
+results_covid_icuvent <- data.frame(lfcShrink(dds=rnaseq_dds, coef=3))
+results_covid_icuvent <- merge((results_covid_icuvent), tx2gene[!duplicated(tx2gene[,c(2,3,5)]),c(2,3,4,5)], by.x=0, by.y=1)
+```
+
+```{r, eval=T}
+df.write <- subset(results_covid_icuvent, padj < 0.05 & gene_biotype != "protein_coding")
+colnames(df.write)[1] <- "ensembl_gene_id"
+df.write <- df.write[!duplicated(df.write[,1:9]),1:9]
+write.table(df.write, file="rnaseq_sig_nc_covid_icuvent.txt", quote=F, row.names=F, sep='\t')
+```
+
+# differential expression analysis, age + sex matching
+
+```{r, eval=T}
+set.seed(1)
+sampleinfo_matched <- subset(sampleinfo, treatment != "ICU/VENT")
+txi_patients_matched <- txi_patients
+txi_patients_matched$abundance <- txi_patients$abundance[,row.names(sampleinfo_matched)]
+txi_patients_matched$counts <- txi_patients$counts[,row.names(sampleinfo_matched)]
+txi_patients_matched$length <- txi_patients$length[,row.names(sampleinfo_matched)]
+
+rnaseq_dds_match <- DESeqDataSetFromTximport(txi_patients_matched, colData = sampleinfo_matched, design = ~treatment+AgeSex)
+rnaseq_dds_match <- DESeq(rnaseq_dds_match)
+```
+
+```{r, eval=T}
+set.seed(1)
+results_match_covid_control <- data.frame(lfcShrink(dds=rnaseq_dds_match, coef=2))
+results_match_covid_control <- merge(results_match_covid_control, tx2gene[!duplicated(tx2gene[,c(2,3,4,5)]),c(2,3,4,5)], by.x=0, by.y=1)
+```
+
+```{r, eval=T, fig.width=2, fig.height=2}
+results_match_covid_control2 <- results_match_covid_control
+results_match_covid_control2$external_gene_name[which(results_match_covid_control2$external_gene_name=="C5orf56")] <- "C5orf56 / IRF1-AS1"
+
+ggplot(subset(results_match_covid_control2, gene_biotype != "protein_coding"), aes(x=log2FoldChange, y=-log10(padj))) + geom_point(pch=20, color="lightgray", alpha=0.5, data=subset(results_match_covid_control2, gene_biotype != "protein_coding" & padj > 0.05)) + geom_point(pch=20, color="indianred", data=subset(results_match_covid_control2, gene_biotype != "protein_coding" & padj < 0.05 & log2FoldChange > 0), alpha=0.5) + geom_point(pch=20, color="skyblue", data=subset(results_match_covid_control2, gene_biotype != "protein_coding" & padj < 0.05 & log2FoldChange < 0), alpha=0.5) + theme_classic()+ geom_hline(yintercept=0, lty=3) +
+  geom_hline(yintercept=-log10(0.05), lty=3, color="red") + geom_vline(xintercept=0, lty=3, color="red") + ylab("-Log10 FDR") + xlab("Log2 Fold Change, COVID-19 vs. Control\nAge/Sex-Matched") +
+  geom_text_repel(data=subset(results_match_covid_control2, external_gene_name %in% c("LINC01007", "LINC00294", "LINC01094", "LINC00844", "MALAT1", "NEAT1", "OPI5-AS1", "MIR7-3HG", "LINC00643", "LINC00507", "BCYRN1", "LINC01138", "SOX21-AS1", "LINC01094", "NEAT1", "AC234582.1", "PEG13", "AL031985.3", "LINC00643", "HTR7P1", "AL136964.1", "HCP5", "C5orf56 / IRF1-AS1", "PAXIP1-AS2", "LINC-PINT", "GOLGA2P5", "FIRRE", "BISPR", "FAM3C2", "LINC01007", "LINC00294") & padj < 0.05), aes(label=external_gene_name), size=2.5, segment.alpha=0.5, force = 2, box.padding=0.1) + geom_point(data=subset(results_match_covid_control2, external_gene_name %in% c("LINC01007", "LINC00294", "LINC01094", "LINC00844", "MALAT1", "NEAT1", "OPI5-AS1", "MIR7-3HG", "LINC00643", "LINC00507", "BCYRN1", "LINC01138", "SOX21-AS1", "LINC01094", "NEAT1", "AC234582.1", "PEG13", "AL031985.3", "LINC00643", "HTR7P1", "AL136964.1", "HCP5", "C5orf56 / IRF1-AS1", "PAXIP1-AS2", "LINC-PINT", "GOLGA2P5", "FIRRE", "BISPR", "FAM3C2", "LINC01007", "LINC00294") & padj < 0.05), color="black", size=1)
+
+```
+
+```{r, eval=T}
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0 & gene_biotype == "protein_coding")$Row.names))
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0 & gene_biotype == "protein_coding")$Row.names))
+
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0 & gene_biotype == "antisense")$Row.names))
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0 & gene_biotype == "antisense")$Row.names))
+
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0 & gene_biotype == "lincRNA")$Row.names))
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0 & gene_biotype == "lincRNA")$Row.names))
+
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0 & gene_biotype == "processed_pseudogene")$Row.names))
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0 & gene_biotype == "processed_pseudogene")$Row.names))
+
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0 & !(gene_biotype %in% c("processed_pseudogene", "lincRNA", "antisense", "protein_coding")))$Row.names))
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0 & !(gene_biotype %in% c("processed_pseudogene", "lincRNA", "antisense", "protein_coding")))$Row.names))
+
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0 & gene_biotype != "protein_coding")$Row.names))
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0 & gene_biotype != "protein_coding")$Row.names))
+```
+
+```{r, eval=T}
+df.write <- subset(results_match_covid_control, padj < 0.05 & gene_biotype != "protein_coding")
+colnames(df.write)[1] <- "ensembl_gene_id"
+df.write <- df.write[!duplicated(df.write[,1:9]),1:9]
+write.table(df.write, file="rnaseq_sig_nc_matched_covid_control.txt", quote=F, row.names=F, sep='\t')
+```
+
+```{r, eval=T}
+set.seed(11)
+tsne_lr <- Rtsne(t(rnaseq_vst[intersect(row.names(rnaseq_vst), subset(results_match_covid_control, gene_biotype != "protein_coding" & padj < 0.05)$Row.names),
+                              row.names(subset(sampleinfo, treatment != "ICU/VENT"))]), dims = 2, perplexity=5, max_iter = 10000)
+tsne_lr <- data.frame(row.names(subset(sampleinfo, treatment != "ICU/VENT")), tsne_lr$Y, 
+                      Sample=row.names(subset(sampleinfo, treatment != "ICU/VENT")), 
+                      Treatment=subset(sampleinfo, treatment != "ICU/VENT")[row.names(subset(sampleinfo, treatment != "ICU/VENT")),"treatment"],
+                      Batch=subset(sampleinfo, treatment != "ICU/VENT")[row.names(subset(sampleinfo, treatment != "ICU/VENT")),"Batch"],
+                      Age=subset(sampleinfo, treatment != "ICU/VENT")[row.names(subset(sampleinfo, treatment != "ICU/VENT")),"Age"],
+                      Sex=subset(sampleinfo, treatment != "ICU/VENT")[row.names(subset(sampleinfo, treatment != "ICU/VENT")),"Sex"])
+colnames(tsne_lr) <- c("Name", "dim1", "dim2", "Sample", "Treatment", "Batch", "Age", "Sex")
+```
+
+```{r, eval=T, fig.width=2.5, fig.height=2}
+ggplot(subset(tsne_lr, Name != "CONTROL23"), aes(dim1, dim2)) + geom_point(aes(color=Treatment), size=3, alpha=0.8) + geom_point(data=subset(tsne_lr, Name %in% c("COVID13")), pch=1, size=3, stroke=1.5) + geom_point(data=subset(tsne_lr, Name %in% c("COVID16")), pch=1, size=3, stroke=1.5, color="red") + geom_point(data=subset(tsne_lr, Name %in% c("COVID22")), pch=1, size=3, stroke=1.5, color="blue") + geom_point(data=subset(tsne_lr, Name %in% c("CONTROL22")), pch=1, size=3, stroke=1.5, color="green") + theme_classic() + xlab("TSNE Dimension 1") + ylab("TSNE Dimension 2") + guides(color=guide_legend(title="Group")) #+ theme(legend.position = "none")
+```
+
+# Guilt-by-association pathway analysis
+
+Note: to run this analysis one will need each TCGA study's RNA-seq dataset with ensembl gene counts normalized as TPMs. 
+This file can be readily generated from TCGA datasets. Alternatively, these files may be requested from the corresponding authors. 
+
+```{r, eval=T}
+tcga_df <- merge(read.table(file=list.files(path = "TCGA", full.names = T, pattern=".TPM.counts.txt")[1]),
+                 read.table(file=list.files(path = "TCGA", full.names = T, pattern=".TPM.counts.txt")[2]), 
+                 by=0)
+
+for(tcga_file in list.files(path = "TCGA", full.names = T, pattern=".TPM.counts.txt")[-c(1:2)]){
+  print(tcga_file)
+  tmp_df <- read.table(file=tcga_file)
+  tcga_df <- merge(tcga_df, tmp_df, by.x=1, by.y=0)
+}
+
+row.names(tcga_df) <- tcga_df[,1]
+tcga_df <- tcga_df[,-1]
+
+tcga_df <- log2(tcga_df + 1) # convert to log2 (TPM + 1)
+```
+
+```{r, eval=T}
+go.list <- as.list(org.Hs.egGO2ALLEGS)
+go.ont <- sapply(names(go.list), Ontology)
+names(go.ont) <- unlist(strsplit(names(go.ont), "[.]"))[c(T,F)]
+names(go.list) <- sapply(names(go.list), function(x) { paste0(x, "-", unname(Term(x))) })
+
+gobp.list <- go.list[which(go.ont=="BP")]
+
+gobp.sub <- gobp.list[which(str_replace_all(names(gobp.list), "[-].*", "") %in% c("GO:0050890", "GO:0099536", "GO:0002253", "GO:0006974", "GO:0051932", "GO:0001963", "GO:0048167", "GO:0035249", "GO:0007005", "GO:0007613", "GO:0007616", "GO:0007611", "GO:0007215"))]
+```
+
+
+```{r, eval=T}
+covid_control_ranks_entrez <- sign(subset(results_match_covid_control, padj < 0.5 & !is.na(entrezgene))$log2FoldChange) *
+  -log10(subset(results_match_covid_control, padj < 0.5 & !is.na(entrezgene))$padj)
+
+names(covid_control_ranks_entrez) <- as.character(subset(results_match_covid_control, padj < 0.5 & !is.na(entrezgene))$entrezgene)
+```
+
+```{r, eval=T}
+results_covid_sig <- subset(results_match_covid_control, padj < 0.05)
+results_covid_sig <- results_covid_sig[order(sign(results_covid_sig$log2FoldChange) * -log10(results_covid_sig$padj)),]
+
+goi <- c(intersect(head(subset(results_covid_sig, gene_biotype != "protein_coding")$Row.names, 12), row.names(tcga_df)), 
+         intersect(tail(subset(results_covid_sig, gene_biotype != "protein_coding" & !(Row.names %in% c("ENSG00000274266")))$Row.names, 10), row.names(tcga_df)),
+         subset(results_covid_sig, external_gene_name %in% c("NEAT1"))$Row.names)
+```
+
+```{r, eval=T}
+# determine gene correlations with GOI
+cor_g <- t(cor(t(tcga_df[goi,]), t(tcga_df)))
+cor_g <- merge(cor_g, subset(tx2gene[!duplicated(tx2gene[,c(2,4)]),c(2,4)], !is.na(entrezgene)), by.x=0, by.y=1)
+```
+
+```{r, eval=T}
+set.seed(1)
+fgsea_gobp <- data.frame(cbind(Gene="Protein-Coding Genes", fgsea(pathways=gobp.sub, stats=covid_control_ranks_entrez)[,c(1,2,3,6,7)]))
+
+fgsea_gobp <- fgsea_gobp[order(fgsea_gobp$NES),]
+fgsea_gobp$pathway <- factor(fgsea_gobp$pathway, levels=unique(fgsea_gobp$pathway))
+fgsea_gobp <- subset(fgsea_gobp, padj < 0.05)
+```
+
+```{r, eval=T}
+set.seed(1)
+for(g in goi){
+  # rank genes, include genes with entrez IDs
+  g_ranks <- cor_g[,g]
+  names(g_ranks) <- as.character(cor_g[,"entrezgene"])
+  
+  # plug into fgsea containing *only* GO pathways of interest
+  fgsea_gobp <- rbind(fgsea_gobp, 
+                      cbind(Gene=g, data.frame(fgsea(pathways=gobp.sub, stats=g_ranks)[,c(1,2,3,6,7)])))
+  
+  # return dataframe with gsea results + gene of interest...
+}
+
+fgsea_gobp <- merge(fgsea_gobp, tx2gene[!duplicated(tx2gene[,c("ensembl_gene_id", "external_gene_name")]),c("ensembl_gene_id", "external_gene_name")], by.x="Gene", by.y="ensembl_gene_id", all.x=T)
+
+fgsea_gobp$external_gene_name[which(fgsea_gobp$external_gene_name=="")] <- fgsea_gobp$Gene[which(fgsea_gobp$external_gene_name=="")]
+fgsea_gobp$external_gene_name[which(is.na(fgsea_gobp$external_gene_name))] <- "Protein-Coding Genes"
+
+fgsea_gobp$Gene <- factor(fgsea_gobp$Gene, levels=c("Protein-Coding Genes", goi))
+fgsea_gobp <- fgsea_gobp[order(fgsea_gobp$Gene),]
+
+fgsea_gobp$external_gene_name <- factor(fgsea_gobp$external_gene_name, levels=unique(fgsea_gobp$external_gene_name))
+fgsea_gobp$NES[which(fgsea_gobp$padj > 0.05)] <- 0
+```
+
+```{r, eval=T, fig.width=3, fig.height=4}
+levels(fgsea_gobp$external_gene_name)[18] <- "C5orf56 / IRF1-AS1"
+
+ggplot(subset(fgsea_gobp, padj < 0.05 & external_gene_name!="Protein-Coding Genes"), aes(y=pathway, x=external_gene_name)) + geom_point(aes(color=NES, size=-log10(padj))) + theme_classic() + theme(legend.position = "right", axis.text.x = element_text(vjust=0.5, hjust=1, size=8, angle = 90)) + 
+scale_color_gradient2(low="blue", mid="white", high="red", midpoint=0) + guides(size=guide_legend("-Log10(FDR)")) + geom_vline(xintercept=10.5, lty=3) + ylab("") + xlab("") + coord_flip()
+```
+
+# ROSMAP sample cohort assessment
+
+Importing ROSMAP count matrix, removing unmapped features
+60725 genes, 639 samples
+
+```{r, eval=T}
+rosmap_mat <- read.table(file="ROSMAP_all_counts_matrix.txt", sep='\t', quote="", header=T)
+rosmap_mat <- rosmap_mat[-c(1:4),]
+row.names(rosmap_mat) <- str_replace_all(rosmap_mat$feature, "[.].*", "")
+rosmap_mat <- rosmap_mat[,-1]
+```
+
+```{r, eval=T}
+rosmap_clinical <- read.csv(file="ROSMAP_clinical.csv", stringsAsFactors = T)
+rosmap_biospecimen <- read.csv(file="ROSMAP_biospecimen_metadata.csv", stringsAsFactors=T)
+
+rosmap_biospecimen <- subset(rosmap_biospecimen, make.names(specimenID) %in% colnames(rosmap_mat) & assay == "rnaSeq" & is.na(exclude))
+rosmap_biospecimen <- merge(rosmap_biospecimen,rosmap_clinical, by="individualID")
+rosmap_biospecimen$sampleID <- make.names(rosmap_biospecimen$specimenID)
+
+rosmap_mat <- rosmap_mat[,rosmap_biospecimen$sampleID]
+
+rosmap_biospecimen$age_death <- as.character(rosmap_biospecimen$age_death)
+rosmap_biospecimen$age_death[which((rosmap_biospecimen$age_death) == "90+")] <- 95
+rosmap_biospecimen$age_death <- as.numeric(rosmap_biospecimen$age_death)
+
+row.names(rosmap_biospecimen) <- rosmap_biospecimen$sampleID
+```
+
+Possible variables:
+- "msex" - self-reported sex (1 = male; 0 = female)
+- educ - years of education
+- race - racial group (1 = white)
+- spanish - hispanic origin (2 = no)
+- apoe_genotype - three alleles (6 genotypes)
+- age_death - age at death
+- pmi - postmortem interval
+- braaksc / ceradsc - pathological findings
+- cogdx - final summarized clinical diagnosis (1 = no CI; 4-6 = severe dementia; 2-3 = mild CI)
+- dcfdx_lv = cogdx (at last visit)
+- cts_mmse30_lv - minimental last visit
+
+** key covariates
+- sex
+
+```{r, eval=T}
+rosmap_biospecimen <- subset(rosmap_biospecimen, !is.na(cts_mmse30_lv))
+rosmap_biospecimen$mmse30_group <- ifelse(rosmap_biospecimen$cts_mmse30_lv >= 25, "High", "Low")
+
+rosmap_mat <- rosmap_mat[,row.names(rosmap_biospecimen)]
+```
+
+```{r, eval=T}
+rosmap_dds <- DESeqDataSetFromMatrix(rosmap_mat, colData = rosmap_biospecimen, design = ~msex + mmse30_group)
+```
+
+```{r, eval=T}
+set.seed(1)
+rosmap_dds <- DESeq(rosmap_dds)
+results_rosmap <- lfcShrink(rosmap_dds, coef=3) # mmse30 low vs high
+results_rosmap <- merge(data.frame(results_rosmap), tx2gene[!duplicated(tx2gene[,c(2,3)]),c(2,3,5)], by.x=0, by.y=1)
+```
+
+```{r, eval=T, fig.width=2, fig.height=2}
+results_rosmap2 <- results_rosmap
+results_rosmap2$external_gene_name[which(results_rosmap2$external_gene_name=="C5orf56")] <- "C5orf56 / IRF1-AS1"
+
+ggplot(subset(results_rosmap, gene_biotype != "protein_coding"), aes(x=log2FoldChange, y=-log10(padj))) + geom_point(pch=20, color="lightgray", alpha=0.5, data=subset(results_rosmap, gene_biotype != "protein_coding" & padj > 0.05)) + geom_point(pch=20, color="indianred", data=subset(results_rosmap, gene_biotype != "protein_coding" & padj < 0.05 & log2FoldChange > 0), alpha=0.5) + geom_point(pch=20, color="skyblue", data=subset(results_rosmap, gene_biotype != "protein_coding" & padj < 0.05 & log2FoldChange < 0), alpha=0.5) + theme_classic()+ geom_hline(yintercept=0, lty=3) +
+  geom_hline(yintercept=-log10(0.05), lty=3, color="red") + geom_vline(xintercept=0, lty=3, color="red") + ylab("-Log10 FDR") + xlab("Log2 Fold Change, Low vs. High MMSE30") +
+  geom_text_repel(data=subset(results_rosmap2, external_gene_name %in% c("LINC00844", "LINC01138", "SOX21-AS1", "LINC01094", "NEAT1", "AC234582.1", "PEG13", "AL031985.3", "LINC00643", "HTR7P1", "AL136964.1", "HCP5", "C5orf56 / IRF1-AS1", "PAXIP1-AS2", "LINC-PINT", "GOLGA2P5", "FIRRE", "BISPR", "FAM3C2", "LINC01007", "LINC00294") & padj < 0.05), aes(label=external_gene_name), size=2.5, segment.alpha=0.5, force = 3, max.overlaps=20) + geom_point(data=subset(results_rosmap2, external_gene_name %in% c("LINC00844", "LINC01138", "SOX21-AS1", "LINC01094", "NEAT1", "AC234582.1", "PEG13", "AL031985.3", "LINC00643", "HTR7P1", "AL136964.1", "HCP5", "C5orf56 / IRF1-AS1", "PAXIP1-AS2", "LINC-PINT", "GOLGA2P5", "FIRRE", "BISPR", "FAM3C2", "LINC01007", "LINC00294") & padj < 0.05), color="black", size=1)
+```
+
+```{r, eval=T}
+df.write <- subset(results_rosmap, padj < 0.05 & gene_biotype != "protein_coding")
+colnames(df.write)[1] <- "ensembl_gene_id"
+df.write <- df.write[!duplicated(df.write[,1:8]),1:8]
+write.table(df.write, file="rnaseq_sig_nc_rosmap.txt", quote=F, row.names=F, sep='\t')
+```
+
+```{r, eval=T}
+length(unique(subset(results_rosmap, padj < 0.05 & log2FoldChange > 0 & gene_biotype == "protein_coding")$Row.names))
+length(unique(subset(results_rosmap, padj < 0.05 & log2FoldChange < 0 & gene_biotype == "protein_coding")$Row.names))
+
+length(unique(subset(results_rosmap, padj < 0.05 & log2FoldChange > 0 & gene_biotype != "protein_coding")$Row.names))
+length(unique(subset(results_rosmap, padj < 0.05 & log2FoldChange < 0 & gene_biotype != "protein_coding")$Row.names))
+```
+
+```{r, eval=T, fig.width=3, fig.height=4}
+rnaseq_vst_subset <- rnaseq_vst[subset(results_rosmap, padj < 0.05 & gene_biotype != "protein_coding" & Row.names %in% subset(results_match_covid_control, padj < 0.05)$Row.names)[c(head(order(subset(results_rosmap, padj < 0.05 & gene_biotype != "protein_coding" & Row.names %in% subset(results_match_covid_control, padj < 0.05)$Row.names)$log2FoldChange), 30),
+                              tail(order(subset(results_rosmap, padj < 0.05 & gene_biotype != "protein_coding" & Row.names %in% subset(results_match_covid_control, padj < 0.05)$Row.names)$log2FoldChange), 30)),]$Row.names,]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[,c(row.names(subset(sampleinfo, treatment=="Control"))[order(subset(sampleinfo, treatment=="Control")$Age)], row.names(subset(sampleinfo, treatment=="COVID-19"))[order(subset(sampleinfo, treatment=="COVID-19")$Age)])]
+rnaseq_vst_subset <- rnaseq_vst_subset[,colnames(rnaseq_vst_subset) != "CONTROL23"]
+
+row.names(rnaseq_vst_subset)[which(tx2gene[!duplicated(tx2gene[,2:3]),3][match(row.names(rnaseq_vst_subset), tx2gene[!duplicated(tx2gene[,2:3]),2])] != "")] <- tx2gene[!duplicated(tx2gene[,2:3]),3][match(row.names(rnaseq_vst_subset), tx2gene[!duplicated(tx2gene[,2:3]),2])][which(tx2gene[!duplicated(tx2gene[,2:3]),3][match(row.names(rnaseq_vst_subset), tx2gene[!duplicated(tx2gene[,2:3]),2])] != "")]
+```
+
+```{r, eval=T, fig.width=4, fig.height=4}
+anno_colors <- list(Group = c(Control="gray", COVID="black"),
+                    Age = rev(viridis(13)[5:12]),
+                    Sex = c(M="blue3", F="red3"))
+
+annotation_col <- data.frame(Group = c(rep("Control", 22), rep("COVID", 22)), 
+                             Age = sampleinfo[colnames(rnaseq_vst_subset), "Age"],
+                             Sex = sampleinfo[colnames(rnaseq_vst_subset), "Sex"],
+                             row.names=colnames(rnaseq_vst_subset))
+
+pheatmap(rnaseq_vst_subset, scale = "row", cluster_cols = F, cluster_rows=F, treeheight_row=0,
+         annotation_col=annotation_col, annotation_colors = anno_colors,
+         cellwidth=6, cellheight=8, 
+         color = c(colorRampPalette(c("blue", "blue", "white","red", "red"))(21)),
+         gaps_col = c(22), gaps_row = c(30), show_colnames = F)
+```
+
+```{r, eval=T}
+cognition_paths <- list(cognition_up_npc = subset(results_rosmap, padj < 5e-2 & log2FoldChange > 0 & gene_biotype != "protein_coding")$Row.names,
+                    cognition_dn_npc = subset(results_rosmap, padj < 5e-2 & log2FoldChange < 0 & gene_biotype != "protein_coding")$Row.names)
+```
+
+```{r, eval=T}
+rnaseq_covid_ranks <- sign(subset(results_match_covid_control, padj < 0.5 & gene_biotype != "protein_coding")$log2FoldChange) * -log10(subset(results_match_covid_control, padj < 0.5 & gene_biotype != "protein_coding")$padj)
+names(rnaseq_covid_ranks) <- subset(results_match_covid_control, padj < 0.5 & gene_biotype != "protein_coding")$Row.names
+
+rnaseq_covid_icu_ranks <- sign(subset(results_covid_icuvent, padj < 0.5 & gene_biotype != "protein_coding")$log2FoldChange) * -log10(subset(results_covid_icuvent, padj < 0.5 & gene_biotype != "protein_coding")$padj)
+names(rnaseq_covid_icu_ranks) <- subset(results_covid_icuvent, padj < 0.5 & gene_biotype != "protein_coding")$Row.names
+```
+
+```{r, eval=T}
+set.seed(1)
+fgsea_cognition_icu <- fgsea(pathways=cognition_paths, stats=rnaseq_covid_icu_ranks, eps=0)
+fgsea_cognition_icu
+```
+
+```{r, eval=T, fig.width=1.4, fig.height=1.2}
+set.seed(1)
+plotEnrichment(cognition_paths$cognition_up_npc, rnaseq_covid_icu_ranks) + xlab(paste0("COVID-19 vs. ICU/VENT\nCognition Up Gene Set\nNES = ", signif(subset(data.frame(fgsea_cognition_icu[,1:7]), pathway=="cognition_up_npc")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_cognition_icu[,1:7]), pathway=="cognition_up_npc")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(cognition_paths$cognition_dn_npc, rnaseq_covid_icu_ranks) + xlab(paste0("COVID-19 vs. ICU/VENT\nCognition Dn Gene Set\nNES = ", signif(subset(data.frame(fgsea_cognition_icu[,1:7]), pathway=="cognition_dn_npc")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_cognition_icu[,1:7]), pathway=="cognition_dn_npc")$pval, 3))) + ylab("Enrichment Score")
+```
+
+```{r, eval=T}
+set.seed(1)
+fgsea_cognition <- fgsea(pathways=cognition_paths, stats=rnaseq_covid_ranks, eps=0)
+fgsea_cognition
+```
+
+```{r, eval=T, fig.width=1.4, fig.height=1.2}
+set.seed(1)
+plotEnrichment(cognition_paths$cognition_up_npc, rnaseq_covid_ranks) + xlab(paste0("COVID-19 vs. Control\nCognition Up Gene Set\nNES = ", signif(subset(data.frame(fgsea_cognition[,1:7]), pathway=="cognition_up_npc")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_cognition[,1:7]), pathway=="cognition_up_npc")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(cognition_paths$cognition_dn_npc, rnaseq_covid_ranks) + xlab(paste0("COVID-19 vs. Control\nCognition Dn Gene Set\nNES = ", signif(subset(data.frame(fgsea_cognition[,1:7]), pathway=="cognition_dn_npc")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_cognition[,1:7]), pathway=="cognition_dn_npc")$pval, 3))) + ylab("Enrichment Score")
+```
+
+# in vitro cytokine treatments
+
+```{r, eval=T}
+set.seed(42)
+
+## List all directories containing data  
+samples_neuron <- list.files(path = "rnaseq_neuron/", full.names = T, pattern=".sf")
+names(samples_neuron) <- str_replace_all(str_replace_all(samples_neuron, "rnaseq_neuron//", ""), ".salmon.sf", "")
+
+# Run tximport
+txi_neuron <- tximport(samples_neuron, type="salmon", tx2gene=tx2gene[,c("ensembl_transcript_id", "ensembl_gene_id")], countsFromAbundance="lengthScaledTPM", ignoreTxVersion = T)
+```
+
+```{r, eval=T}
+sampleinfo_neuron <- data.frame(row.names = names(samples_neuron), 
+                         treatment = substrLeft(names(samples_neuron), 2))
+```
+
+```{r, eval=T}
+set.seed(42)
+rnaseq_dds_neuron <- DESeqDataSetFromTximport(txi_neuron, colData = sampleinfo_neuron, design = ~treatment)
+```
+
+```{r, eval=T}
+set.seed(42)
+rnaseq_vst_neuron <- assay(varianceStabilizingTransformation(rnaseq_dds_neuron))
+```
+
+# differential expression analysis, age + sex matching
+
+```{r, eval=T}
+set.seed(1)
+rnaseq_dds_neuron <- DESeq(rnaseq_dds_neuron)
+```
+
+```{r, eval=T}
+set.seed(1)
+results_neuron_IFNBHI_CTRL <- merge(data.frame(lfcShrink(rnaseq_dds_neuron, coef=2)), tx2gene[!duplicated(tx2gene[,c(2,3,5)]),c(2,3,5)], by.x=0, by.y=1)
+results_neuron_IFNBLO_CTRL <- merge(data.frame(lfcShrink(rnaseq_dds_neuron, coef=3)), tx2gene[!duplicated(tx2gene[,c(2,3,5)]),c(2,3,5)], by.x=0, by.y=1)
+
+results_neuron_IFNGHI_CTRL <- merge(data.frame(lfcShrink(rnaseq_dds_neuron, coef=4)), tx2gene[!duplicated(tx2gene[,c(2,3,5)]),c(2,3,5)], by.x=0, by.y=1)
+results_neuron_IFNGLO_CTRL <- merge(data.frame(lfcShrink(rnaseq_dds_neuron, coef=5)), tx2gene[!duplicated(tx2gene[,c(2,3,5)]),c(2,3,5)], by.x=0, by.y=1)
+
+results_neuron_TNFAHI_CTRL <- merge(data.frame(lfcShrink(rnaseq_dds_neuron, coef=6)), tx2gene[!duplicated(tx2gene[,c(2,3,5)]),c(2,3,5)], by.x=0, by.y=1)
+results_neuron_TNFALO_CTRL <- merge(data.frame(lfcShrink(rnaseq_dds_neuron, coef=7)), tx2gene[!duplicated(tx2gene[,c(2,3,5)]),c(2,3,5)], by.x=0, by.y=1)
+```
+
+```{r, eval=T}
+df_list <- list(IFNBHI_CTRL=results_neuron_IFNBHI_CTRL,
+                IFNGHI_CTRL=results_neuron_IFNGHI_CTRL,
+                TNFAHI_CTRL=results_neuron_TNFAHI_CTRL)
+
+neuron_lncs <- c()
+
+for(df in names(df_list)){
+results_df <- df_list[[df]]
+neuron_lncs <- c(neuron_lncs, subset(results_df, gene_biotype != "protein_coding" & padj < 0.05 & (Row.names %in% intersect(subset(results_rosmap, padj < 0.05 & log2FoldChange > 0)$Row.names, subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0)$Row.names) & log2FoldChange > 0 | Row.names %in% intersect(subset(results_rosmap, padj < 0.05 & log2FoldChange < 0)$Row.names, subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0)$Row.names) & log2FoldChange < 0))$Row.names)
+}
+neuron_lncs <- unique(neuron_lncs)
+```
+
+```{r, eval=T, fig.width=1.5, fig.height=1.5}
+rnaseq_vst_subset <- merge(rnaseq_vst_neuron, tx2gene[!duplicated(tx2gene[,c("ensembl_gene_id", "external_gene_name")]),c("ensembl_gene_id", "external_gene_name")], by.x=0, by.y=1)
+rnaseq_vst_subset <- rnaseq_vst_subset[rnaseq_vst_subset$Row.names %in% unique(neuron_lncs),]
+row.names(rnaseq_vst_subset) <- rnaseq_vst_subset$external_gene_name
+rnaseq_vst_subset <- rnaseq_vst_subset[,!(colnames(rnaseq_vst_subset) %in% c("external_gene_name", "Row.names"))]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[,!(grepl("LO_", colnames(rnaseq_vst_subset)))]
+colnames(rnaseq_vst_subset) <- str_replace_all(colnames(rnaseq_vst_subset), "_HI","")
+```
+
+```{r, eval=T, fig.width=2, fig.height=1.5}
+anno_colors <- list(Group = c(CTRL="black", 
+                              IFNB=viridis(5)[3],
+                              IFNG=viridis(5)[4],
+                              TNFA=viridis(5)[5]))
+
+annotation_col <- data.frame(Group = substrLeft(colnames(rnaseq_vst_subset), 2), 
+                             row.names=colnames(rnaseq_vst_subset))
+
+row.names(rnaseq_vst_subset)[which(row.names(rnaseq_vst_subset)=="C5orf56")] <- "C5orf56 / IRF1-AS1"
+
+pheatmap(rnaseq_vst_subset, cluster_cols = F, scale="row",
+         cluster_rows = T, treeheight_row=0,
+         annotation_col=annotation_col, annotation_colors = anno_colors,
+         cellwidth=10, cellheight=8, fontsize=8, #fontsize_row=5,
+         color = c(colorRampPalette(c("blue", "blue", "white", "red", "red"))(21)))
+```
+
+```{r, eval=T, fig.width=1.5, fig.height=1.5}
+rnaseq_vst_subset <- merge(rnaseq_vst_neuron, subset(tx2gene[!duplicated(tx2gene[,c("ensembl_gene_id", "external_gene_name")]),c("ensembl_gene_id", "external_gene_name")], external_gene_name %in% c("C5orf56", "SOX21-AS1", "PAXIP1-AS2", "IRF1", "PAXIP1", "SOX21")), by.x=0, by.y=1)
+row.names(rnaseq_vst_subset) <- rnaseq_vst_subset$external_gene_name
+rnaseq_vst_subset <- rnaseq_vst_subset[,!(colnames(rnaseq_vst_subset) %in% c("external_gene_name", "Row.names"))]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[,!(grepl("LO_", colnames(rnaseq_vst_subset)))]
+colnames(rnaseq_vst_subset) <- str_replace_all(colnames(rnaseq_vst_subset), "_HI","")
+```
+
+```{r, eval=T, fig.width=2, fig.height=1.5}
+anno_colors <- list(Group = c(CTRL="black", 
+                              IFNB=viridis(5)[3],
+                              IFNG=viridis(5)[4],
+                              TNFA=viridis(5)[5]))
+
+annotation_col <- data.frame(Group = substrLeft(colnames(rnaseq_vst_subset), 2), 
+                             row.names=colnames(rnaseq_vst_subset))
+
+row.names(rnaseq_vst_subset)[which(row.names(rnaseq_vst_subset)=="C5orf56")] <- "C5orf56 / IRF1-AS1"
+
+pheatmap(rnaseq_vst_subset, cluster_cols = F, scale="row",
+         cluster_rows = T, treeheight_row=0,
+         annotation_col=annotation_col, annotation_colors = anno_colors,
+         cellwidth=10, cellheight=8, fontsize=8, #fontsize_row=5,
+         color = c(colorRampPalette(c("blue", "blue", "white", "red", "red"))(21)))
+```
+
+```{r, eval=T}
+df_list <- list(IFNBHI_CTRL=results_neuron_IFNBHI_CTRL, 
+                IFNGHI_CTRL=results_neuron_IFNGHI_CTRL, 
+                TNFAHI_CTRL=results_neuron_TNFAHI_CTRL)
+
+for(df in names(df_list)){
+results_df <- subset(df_list[[df]], padj < 0.05 & gene_biotype != "protein_coding")
+colnames(results_df)[1] <- "ensembl_gene_id"
+results_df <- results_df[!duplicated(results_df[,1:8]),1:8]
+write.table(results_df, file=paste0("rnaseq_sig_nc_", df, ".txt"), quote=F, row.names=F, sep='\t')
+}
+```
+
+```{r, eval=T}
+sessionInfo()
+```
+
+
+
+
+
